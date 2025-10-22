@@ -15,6 +15,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from werkzeug.security import generate_password_hash, check_password_hash
 from bson.objectid import ObjectId
+from flask_cors import CORS
 
 # Local import - your existing function to get the database
 from config import get_database
@@ -24,6 +25,7 @@ from config import get_database
 # ------------------------------------------------------------
 
 app = Flask(__name__, static_folder="dist", static_url_path="/")
+CORS(app, supports_credentials=True)  # Add this line
 
 # ✅ Serve React Frontend
 @app.route("/")
@@ -154,16 +156,22 @@ def signin():
         refresh_token = create_refresh_token(identity=user_id)
 
         user_response = sanitize_doc(user)
-        # Do not include password in response
         user_response.pop('password', None)
 
         logger.info(f"User signed in: {email}")
-        return jsonify({"access_token": access_token, "refresh_token": refresh_token, "user": user_response}), 200
+    
+        return jsonify({
+            "success": True,
+            "message": "Login successful",
+            "access_token": access_token, 
+            "refresh_token": refresh_token, 
+            "user": user_response,
+            "user_id": user_id
+        }), 200
 
     except Exception as e:
         logger.exception("Error during signin")
         return jsonify({"error": str(e)}), 400
-
 
 @app.route('/api/refresh', methods=['POST'])
 @jwt_required(refresh=True)
