@@ -374,6 +374,101 @@ def settle_transaction():
         logger.exception("Error settling transaction")
         return jsonify({"error": str(e)}), 400
 
+@app.route('/api/pending-actions', methods=['GET'])
+@jwt_required()
+def get_pending_actions():
+    """Get all transactions waiting for user's confirmation"""
+    try:
+        user_id = get_jwt_identity()
+        
+        # Find transactions where user is involved and needs to confirm
+        pending_settle = list(data_collection.find({
+            "$or": [
+                {"user_id": user_id},
+                {"receiver_user_id": user_id}
+            ],
+            "status": "pending",
+            "confirmations": {"$ne": user_id}  # User hasn't confirmed yet
+        }))
+        
+        pending_delete = list(data_collection.find({
+            "$or": [
+                {"user_id": user_id},
+                {"receiver_user_id": user_id}
+            ],
+            "status": "pending",
+            "delete_confirmations": {"$ne": user_id}  # User hasn't confirmed deletion yet
+        }))
+        
+        # Combine and format results
+        pending_actions = []
+        
+        for tx in pending_settle + pending_delete:
+            # Determine action type and if user action is needed
+            needs_settle_confirmation = (tx in pending_settle) and (user_id not in tx.get("confirmations", []))
+            needs_delete_confirmation = (tx in pending_delete) and (user_id not in tx.get("delete_confirmations", []))
+            
+            if needs_settle_confirmation or needs_delete_confirmation:
+                # Get the other user's info
+                other_user_id = tx['receiver_user_id'] if tx['user_id'] == user_id else tx['user_id']
+                other_user = user_by_id(other_user_id)
+                
+                action_type = "settle" if needs_settle_confirmation else "delete"
+                initiated_by_other = tx.get("confirmations") or tx.get("delete_confirmations")
+                
+                pending_actions.append({
+                    "transaction_id": str(tx['_id']),
+                    "action_type": action_type,
+                    "amount": tx['money'],
+                    "description": tx['description'],
+                    "date": tx['date'],
+                    "other_user_name": f"{other_user['first_name']} {other_user['last_name']}" if other_user else "Unknown",
+                    "other_user_id": other_user_id,
+                    "initiated_by_me": user_id in (initiated_by_other or []),
+                    "message": f"{other_user['first_name'] if other_user else 'Someone'} requested to {action_type} this transaction" if not initiated_by_other else f"You requested to {action_type} this transaction"
+                })
+        
+        return jsonify({"pending_actions": pending_actions}), 200
+        
+    except Exception as e:
+        logger.exception("Error fetching pending actions")
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route('/api/transaction/<transaction_id>', methods=['GET'])
+@jwt_required()
+def get_transaction_details(transaction_id):
+    """Get detailed information about a specific transaction"""
+    try:
+        user_id = get_jwt_identity()
+        
+        transaction = data_collection.find_one({"_id": objid(transaction_id)})
+        if not transaction:
+            return jsonify({"error": "Transaction not found"}), 404
+        
+        # Check if user is authorized to view this transaction
+        if user_id not in [transaction['user_id'], transaction['receiver_user_id']]:
+            return jsonify({"error": "Not authorized"}), 403
+        
+        # Get user details
+        sender = user_by_id(transaction['user_id'])
+        receiver = user_by_id(transaction['receiver_user_id'])
+        
+        transaction_details = sanitize_doc(transaction)
+        transaction_details.update({
+            "sender_name": f"{sender['first_name']} {sender['last_name']}" if sender else "Unknown",
+            "receiver_name": f"{receiver['first_name']} {receiver['last_name']}" if receiver else "Unknown",
+            "can_settle": user_id not in transaction.get("confirmations", []),
+            "can_delete": user_id not in transaction.get("delete_confirmations", []),
+            "settlement_initiated": len(transaction.get("confirmations", [])) > 0,
+            "delete_initiated": len(transaction.get("delete_confirmations", [])) > 0
+        })
+        
+        return jsonify({"transaction": transaction_details}), 200
+        
+    except Exception as e:
+        logger.exception("Error fetching transaction details")
+        return jsonify({"error": str(e)}), 400
 
 # ------------------------------------------------------------
 # HISTORY
