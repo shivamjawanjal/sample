@@ -196,15 +196,15 @@ def addmoney():
         user_id = get_jwt_identity()
         data = request.get_json(force=True)
 
-        receiver_id = data.get('receiver_id')
+        lender_id = data.get('lender_id')  # Changed from receiver_id to lender_id
         money_raw = data.get('money')
         description = (data.get('description') or '').strip()
 
         # Basic checks
-        if not all([receiver_id, money_raw, description]):
+        if not all([lender_id, money_raw, description]):
             return jsonify({"error": "All fields are required"}), 400
 
-        if user_id == receiver_id:
+        if user_id == lender_id:
             return jsonify({"error": "You cannot add udhar to yourself"}), 400
 
         # Validate money
@@ -215,17 +215,17 @@ def addmoney():
         except Exception:
             return jsonify({"error": "Invalid money value"}), 400
 
-        sender = user_by_id(user_id)
-        receiver = user_by_id(receiver_id)
-        if not sender or not receiver:
-            return jsonify({"error": "Sender or receiver not found"}), 404
+        borrower = user_by_id(user_id)  # Current user is the borrower
+        lender = user_by_id(lender_id)  # The other user is the lender
+        if not borrower or not lender:
+            return jsonify({"error": "Borrower or lender not found"}), 404
 
         now = datetime.utcnow()
         entry = {
-            "user_id": user_id,
-            "user_name": f"{sender['first_name']} {sender['last_name']}",
-            "receiver_user_id": receiver_id,
-            "receiver_name": f"{receiver['first_name']} {receiver['last_name']}",
+            "lender_id": lender_id,  # New field: who lent the money
+            "lender_name": f"{lender['first_name']} {lender['last_name']}",
+            "borrower_id": user_id,  # New field: who borrowed the money (current user)
+            "borrower_name": f"{borrower['first_name']} {borrower['last_name']}",
             "money": money,
             "description": description,
             "date": now,
@@ -235,8 +235,8 @@ def addmoney():
         }
 
         res = data_collection.insert_one(entry)
-        logger.info(f"Transaction added: {res.inserted_id} by {user_id} -> {receiver_id}")
-        return jsonify({"message": "Money record added successfully", "transaction_id": str(res.inserted_id)}), 201
+        logger.info(f"Transaction added: {res.inserted_id} - {lender_id} lent to {user_id}")
+        return jsonify({"message": "Udhar record added successfully", "transaction_id": str(res.inserted_id)}), 201
 
     except Exception as e:
         logger.exception("Error adding money")
@@ -246,12 +246,14 @@ def addmoney():
 @app.route('/api/mylents', methods=['GET'])
 @jwt_required()
 def get_my_lents():
+    """Get money I lent to others (I am the lender)"""
     try:
         user_id = get_jwt_identity()
         page = int(request.args.get('page', 1))
         per_page = int(request.args.get('per_page', 50))
 
-        cursor = data_collection.find({"user_id": user_id}).sort("date", -1).skip((page-1)*per_page).limit(per_page)
+        # I lent money = I am the lender
+        cursor = data_collection.find({"lender_id": user_id}).sort("date", -1).skip((page-1)*per_page).limit(per_page)
         lents = [sanitize_doc(d) for d in cursor]
 
         return jsonify({"count": len(lents), "lents": lents}), 200
@@ -263,12 +265,14 @@ def get_my_lents():
 @app.route('/api/myudhars', methods=['GET'])
 @jwt_required()
 def get_my_udhars():
+    """Get money I borrowed from others (I am the borrower)"""
     try:
         user_id = get_jwt_identity()
         page = int(request.args.get('page', 1))
         per_page = int(request.args.get('per_page', 50))
 
-        cursor = data_collection.find({"receiver_user_id": user_id}).sort("date", -1).skip((page-1)*per_page).limit(per_page)
+        # I borrowed money = I am the borrower
+        cursor = data_collection.find({"borrower_id": user_id}).sort("date", -1).skip((page-1)*per_page).limit(per_page)
         udhars = [sanitize_doc(d) for d in cursor]
 
         return jsonify({"count": len(udhars), "udhars": udhars}), 200
@@ -280,10 +284,14 @@ def get_my_udhars():
 @app.route('/api/mysummary', methods=['GET'])
 @jwt_required()
 def get_summary():
+    """Get summary of lent and borrowed amounts"""
     try:
         user_id = get_jwt_identity()
-        lents = list(data_collection.find({"user_id": user_id}))
-        udhars = list(data_collection.find({"receiver_user_id": user_id}))
+        
+        # Money I lent to others
+        lents = list(data_collection.find({"lender_id": user_id}))
+        # Money I borrowed from others  
+        udhars = list(data_collection.find({"borrower_id": user_id}))
 
         # Convert ObjectIds and calculate totals
         for d in lents + udhars:
@@ -294,11 +302,11 @@ def get_summary():
 
         return jsonify({
             "you_lent": [sanitize_doc(d) for d in lents],
-            "lent_on_you": [sanitize_doc(d) for d in udhars],
+            "you_borrowed": [sanitize_doc(d) for d in udhars],  # Updated key name for clarity
             "totals": {
                 "lent_total": lent_total,
-                "udhar_total": udhar_total,
-                "net_balance": lent_total - udhar_total
+                "borrowed_total": udhar_total,  # Updated key name
+                "net_balance": lent_total - udhar_total  # Positive = net lender, Negative = net borrower
             }
         }), 200
     except Exception as e:
@@ -321,7 +329,8 @@ def delete_transaction():
         if not transaction:
             return jsonify({"error": "Transaction not found"}), 404
 
-        if user_id not in [transaction['user_id'], transaction['receiver_user_id']]:
+        # Check if user is either lender or borrower in this transaction
+        if user_id not in [transaction['lender_id'], transaction['borrower_id']]:
             return jsonify({"error": "You are not authorized for this transaction"}), 403
 
         delete_confirmations = transaction.get("delete_confirmations", [])
@@ -329,7 +338,7 @@ def delete_transaction():
             delete_confirmations.append(user_id)
 
         # Update in DB
-        if all(uid in delete_confirmations for uid in [transaction['user_id'], transaction['receiver_user_id']]):
+        if all(uid in delete_confirmations for uid in [transaction['lender_id'], transaction['borrower_id']]):
             data_collection.update_one({"_id": objid(transaction_id)}, {"$set": {"status": "deleted", "delete_confirmations": delete_confirmations, "deleted_at": datetime.utcnow()}})
             return jsonify({"message": "Transaction deleted successfully"}), 200
         else:
@@ -356,14 +365,15 @@ def settle_transaction():
         if not transaction:
             return jsonify({"error": "Transaction not found"}), 404
 
-        if user_id not in [transaction['user_id'], transaction['receiver_user_id']]:
+        # Check if user is either lender or borrower in this transaction
+        if user_id not in [transaction['lender_id'], transaction['borrower_id']]:
             return jsonify({"error": "You are not authorized for this transaction"}), 403
 
         confirmations = transaction.get("confirmations", [])
         if user_id not in confirmations:
             confirmations.append(user_id)
 
-        if all(uid in confirmations for uid in [transaction['user_id'], transaction['receiver_user_id']]):
+        if all(uid in confirmations for uid in [transaction['lender_id'], transaction['borrower_id']]):
             data_collection.update_one({"_id": objid(transaction_id)}, {"$set": {"status": "settled", "confirmations": confirmations, "settled_at": datetime.utcnow()}})
             return jsonify({"message": "Transaction settled successfully"}), 200
         else:
@@ -381,11 +391,11 @@ def get_pending_actions():
     try:
         user_id = get_jwt_identity()
         
-        # Find transactions where user is involved and needs to confirm
+        # Find transactions where user is involved (as lender or borrower) and needs to confirm
         pending_settle = list(data_collection.find({
             "$or": [
-                {"user_id": user_id},
-                {"receiver_user_id": user_id}
+                {"lender_id": user_id},
+                {"borrower_id": user_id}
             ],
             "status": "pending",
             "confirmations": {"$ne": user_id}  # User hasn't confirmed yet
@@ -393,8 +403,8 @@ def get_pending_actions():
         
         pending_delete = list(data_collection.find({
             "$or": [
-                {"user_id": user_id},
-                {"receiver_user_id": user_id}
+                {"lender_id": user_id},
+                {"borrower_id": user_id}
             ],
             "status": "pending",
             "delete_confirmations": {"$ne": user_id}  # User hasn't confirmed deletion yet
@@ -410,11 +420,19 @@ def get_pending_actions():
             
             if needs_settle_confirmation or needs_delete_confirmation:
                 # Get the other user's info
-                other_user_id = tx['receiver_user_id'] if tx['user_id'] == user_id else tx['user_id']
+                other_user_id = tx['borrower_id'] if tx['lender_id'] == user_id else tx['lender_id']
                 other_user = user_by_id(other_user_id)
                 
                 action_type = "settle" if needs_settle_confirmation else "delete"
                 initiated_by_other = tx.get("confirmations") or tx.get("delete_confirmations")
+                
+                # Determine relationship
+                if tx['lender_id'] == user_id:
+                    relationship = "lent to"
+                    other_person = other_user['first_name'] if other_user else "Unknown"
+                else:
+                    relationship = "borrowed from" 
+                    other_person = other_user['first_name'] if other_user else "Unknown"
                 
                 pending_actions.append({
                     "transaction_id": str(tx['_id']),
@@ -424,6 +442,8 @@ def get_pending_actions():
                     "date": tx['date'],
                     "other_user_name": f"{other_user['first_name']} {other_user['last_name']}" if other_user else "Unknown",
                     "other_user_id": other_user_id,
+                    "relationship": relationship,
+                    "other_person": other_person,
                     "initiated_by_me": user_id in (initiated_by_other or []),
                     "message": f"{other_user['first_name'] if other_user else 'Someone'} requested to {action_type} this transaction" if not initiated_by_other else f"You requested to {action_type} this transaction"
                 })
@@ -447,17 +467,18 @@ def get_transaction_details(transaction_id):
             return jsonify({"error": "Transaction not found"}), 404
         
         # Check if user is authorized to view this transaction
-        if user_id not in [transaction['user_id'], transaction['receiver_user_id']]:
+        if user_id not in [transaction['lender_id'], transaction['borrower_id']]:
             return jsonify({"error": "Not authorized"}), 403
         
         # Get user details
-        sender = user_by_id(transaction['user_id'])
-        receiver = user_by_id(transaction['receiver_user_id'])
+        lender = user_by_id(transaction['lender_id'])
+        borrower = user_by_id(transaction['borrower_id'])
         
         transaction_details = sanitize_doc(transaction)
         transaction_details.update({
-            "sender_name": f"{sender['first_name']} {sender['last_name']}" if sender else "Unknown",
-            "receiver_name": f"{receiver['first_name']} {receiver['last_name']}" if receiver else "Unknown",
+            "lender_name": f"{lender['first_name']} {lender['last_name']}" if lender else "Unknown",
+            "borrower_name": f"{borrower['first_name']} {borrower['last_name']}" if borrower else "Unknown",
+            "your_role": "lender" if user_id == transaction['lender_id'] else "borrower",
             "can_settle": user_id not in transaction.get("confirmations", []),
             "can_delete": user_id not in transaction.get("delete_confirmations", []),
             "settlement_initiated": len(transaction.get("confirmations", [])) > 0,
@@ -506,6 +527,57 @@ def lent_history():
 # FRIENDS (single record approach)
 # ------------------------------------------------------------
 
+@app.route('/api/lent_history', methods=['GET'])
+@jwt_required()
+def lent_history():
+    try:
+        user_id = get_jwt_identity()
+        history = list(data_collection.find({
+            "$and": [
+                {"$or": [
+                    {"lender_id": user_id},
+                    {"borrower_id": user_id}
+                ]},
+                {"status": {"$in": ["settled", "deleted"]}}
+            ]
+        }).sort("date", -1))
+
+        for item in history:
+            item['_id'] = str(item['_id'])
+            if item['status'] == "settled":
+                item['completed_at'] = item.get('settled_at')
+            elif item['status'] == "deleted":
+                item['completed_at'] = item.get('deleted_at')
+
+        return jsonify({"count": len(history), "history": history} if history else {"message": "No history found"}), 200
+    except Exception as e:
+        logger.exception("Error getting history")
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route('/api/transactions/search', methods=['GET'])
+@jwt_required()
+def search_transactions():
+    try:
+        user_id = get_jwt_identity()
+        q = request.args.get('q', '')
+        status = request.args.get('status')
+        page = int(request.args.get('page', 1))
+        per_page = int(request.args.get('per_page', 50))
+
+        base_filter = {"$or": [{"lender_id": user_id}, {"borrower_id": user_id}]}
+        if status:
+            base_filter["status"] = status
+        if q:
+            base_filter["description"] = {"$regex": q, "$options": "i"}
+
+        cursor = data_collection.find(base_filter).sort("date", -1).skip((page-1)*per_page).limit(per_page)
+        results = [sanitize_doc(d) for d in cursor]
+        return jsonify({"count": len(results), "results": results}), 200
+    except Exception as e:
+        logger.exception("Error searching transactions")
+        return jsonify({"error": str(e)}), 400
+
 @app.route('/api/friends/add', methods=['POST'])
 @jwt_required()
 def add_friend():
@@ -550,36 +622,6 @@ def add_friend():
     except Exception as e:
         logger.exception("Error adding friend")
         return jsonify({"error": str(e)}), 400
-
-
-@app.route('/api/friends/respond', methods=['POST'])
-@jwt_required()
-def respond_friend_request():
-    try:
-        user_id = get_jwt_identity()
-        data = request.get_json(force=True)
-        sender_id = data.get('sender_id')
-        action = data.get('action')  # "accept" or "reject"
-
-        if not all([sender_id, action]):
-            return jsonify({"error": "Sender ID and action required"}), 400
-
-        if action == "accept":
-            now = datetime.utcnow()
-            result = friend_collection.update_one({"sender_id": sender_id, "receiver_id": user_id}, {"$set": {"status": "accepted", "accepted_at": now}})
-            if result.matched_count == 0:
-                return jsonify({"error": "Friend request not found"}), 404
-            return jsonify({"message": "Friend request accepted"}), 200
-        elif action == "reject":
-            friend_collection.delete_one({"sender_id": sender_id, "receiver_id": user_id})
-            return jsonify({"message": "Friend request rejected"}), 200
-        else:
-            return jsonify({"error": "Invalid action"}), 400
-
-    except Exception as e:
-        logger.exception("Error responding to friend request")
-        return jsonify({"error": str(e)}), 400
-
 
 @app.route('/api/friends', methods=['GET'])
 @jwt_required()
@@ -650,6 +692,34 @@ def remove_friend():
     except Exception as e:
         logger.exception("Error removing friend")
         return jsonify({"error": str(e)}), 400
+    
+@app.route('/api/friends/respond', methods=['POST'])
+@jwt_required()
+def respond_friend_request():
+    try:
+        user_id = get_jwt_identity()
+        data = request.get_json(force=True)
+        sender_id = data.get('sender_id')
+        action = data.get('action')  # "accept" or "reject"
+
+        if not all([sender_id, action]):
+            return jsonify({"error": "Sender ID and action required"}), 400
+
+        if action == "accept":
+            now = datetime.utcnow()
+            result = friend_collection.update_one({"sender_id": sender_id, "receiver_id": user_id}, {"$set": {"status": "accepted", "accepted_at": now}})
+            if result.matched_count == 0:
+                return jsonify({"error": "Friend request not found"}), 404
+            return jsonify({"message": "Friend request accepted"}), 200
+        elif action == "reject":
+            friend_collection.delete_one({"sender_id": sender_id, "receiver_id": user_id})
+            return jsonify({"message": "Friend request rejected"}), 200
+        else:
+            return jsonify({"error": "Invalid action"}), 400
+
+    except Exception as e:
+        logger.exception("Error responding to friend request")
+        return jsonify({"error": str(e)}), 400
 
 
 @app.route('/api/friends/requests', methods=['GET'])
@@ -689,11 +759,29 @@ def search_transactions():
         page = int(request.args.get('page', 1))
         per_page = int(request.args.get('per_page', 50))
 
-        base_filter = {"$or": [{"user_id": user_id}, {"receiver_user_id": user_id}]}
+        base_filter = {"$or": [{"lender_id": user_id}, {"borrower_id": user_id}]}
         if status:
             base_filter["status"] = status
+        
+        # Enhanced search to include names
         if q:
-            base_filter["description"] = {"$regex": q, "$options": "i"}
+            # Find users that match the search query
+            matching_users = list(user_collection.find({
+                "$or": [
+                    {"first_name": {"$regex": q, "$options": "i"}},
+                    {"last_name": {"$regex": q, "$options": "i"}},
+                    {"mobile_no": {"$regex": q, "$options": "i"}}
+                ]
+            }))
+            
+            matching_user_ids = [str(user['_id']) for user in matching_users]
+            
+            # Search in description OR involving matching users
+            base_filter["$or"] = [
+                {"description": {"$regex": q, "$options": "i"}},
+                {"lender_id": {"$in": matching_user_ids}},
+                {"borrower_id": {"$in": matching_user_ids}}
+            ]
 
         cursor = data_collection.find(base_filter).sort("date", -1).skip((page-1)*per_page).limit(per_page)
         results = [sanitize_doc(d) for d in cursor]
@@ -701,7 +789,6 @@ def search_transactions():
     except Exception as e:
         logger.exception("Error searching transactions")
         return jsonify({"error": str(e)}), 400
-    
 # ============================================================
 # 1️⃣ USER PROFILE ROUTES
 # ============================================================
@@ -765,8 +852,8 @@ def analytics_summary():
 
         transactions = list(data_collection.find({
             "$or": [
-                {"user_id": user_id},
-                {"receiver_user_id": user_id}
+                {"lender_id": user_id},
+                {"borrower_id": user_id}
             ]
         }))
 
@@ -776,10 +863,10 @@ def analytics_summary():
             elif tx.get("status") == "settled":
                 settled_count += 1
 
-            if tx.get("user_id") == user_id:
-                lent_total += tx.get("amount", 0)
-            elif tx.get("receiver_user_id") == user_id:
-                borrowed_total += tx.get("amount", 0)
+            if tx.get("lender_id") == user_id:
+                lent_total += tx.get("money", 0)
+            elif tx.get("borrower_id") == user_id:
+                borrowed_total += tx.get("money", 0)
 
         summary = {
             "total_lent": lent_total,
@@ -803,7 +890,7 @@ def analytics_summary_v2():
         # Fetch last 10 transactions involving the user
         transactions = list(
             data_collection.find(
-                {"$or": [{"user_id": user_id}, {"receiver_user_id": user_id}]}
+                {"$or": [{"lender_id": user_id}, {"borrower_id": user_id}]}
             ).sort("date", -1).limit(10)
         )
 
@@ -811,29 +898,32 @@ def analytics_summary_v2():
         recent_tx = []
 
         for tx in transactions:
-            sender_id = tx.get("user_id")
-            receiver_id = tx.get("receiver_user_id")
+            lender_id = tx.get("lender_id")
+            borrower_id = tx.get("borrower_id")
             amount = float(tx.get("money", 0))
             date = tx.get("date").strftime("%Y-%m-%d") if tx.get("date") else None
 
-            # Balance calculation: + for received, - for sent
-            if user_id == sender_id:
-                total_balance -= amount
-                title = f"Sent to {tx.get('receiver_name', 'Unknown')}"
-            elif user_id == receiver_id:
-                total_balance += amount
-                title = f"Received from {tx.get('user_name', 'Unknown')}"
+            # Balance calculation: + for received (borrowed), - for sent (lent)
+            if user_id == lender_id:
+                total_balance -= amount  # Money you lent (you gave out)
+                title = f"Lent to {tx.get('borrower_name', 'Unknown')}"
+                transaction_type = "lent"
+            elif user_id == borrower_id:
+                total_balance += amount  # Money you borrowed (you received)
+                title = f"Borrowed from {tx.get('lender_name', 'Unknown')}"
+                transaction_type = "borrowed"
             else:
                 continue
 
             recent_tx.append({
                 "title": title,
-                "amount": amount if user_id == receiver_id else -amount,
-                "date": date
+                "amount": amount if user_id == borrower_id else -amount,
+                "date": date,
+                "type": transaction_type
             })
 
         return jsonify({
-            "total_balance": total_balance,
+            "total_balance": total_balance,  # Positive = net borrower, Negative = net lender
             "recent_transactions": recent_tx
         }), 200
 
